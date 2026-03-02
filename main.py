@@ -8,7 +8,7 @@ import json
 import glob
 import re
 
-# Try imports to support both module execution (uvicorn app.main:app) and script execution (python3 main.py)
+
 try:
     from app.services import analytics
 except ImportError:
@@ -31,8 +31,8 @@ except ImportError:
 
 app = FastAPI(title="Legal Analytics Dashboard")
 
-# Session secret for signed cookies
-# In production, set SESSION_SECRET env var to a strong random string
+
+
 SESSION_SECRET = os.environ.get(
     "SESSION_SECRET", "change-me-to-a-strong-random-secret-key-in-production"
 )
@@ -49,10 +49,6 @@ def md_to_html(text):
     if not text:
         return ""
     text = str(text)
-
-    # 1. Convert headers (e.g., ### Heading -> <h3>Heading</h3>)
-    # Ensure this happens before bold conversion to avoid nesting strong tags inside h tags prematurely if not needed,
-    # but we can also just strip ** if they are in headers
     text = re.sub(
         r"^###\s+(.*)$",
         r'<h3 class="text-sm font-bold mt-4 mb-2 text-slate-800 dark:text-slate-200">\1</h3>',
@@ -117,8 +113,6 @@ def md_to_html(text):
     )
 
     # 4. Convert \n to <br> (only for lines that aren't already wrapped in HTML blocks)
-    # A simple approach is to convert remaining \n to <br>, but avoid doing it between block tags.
-    # We will just do a simple replace for now.
     text = text.replace("\n", "<br>")
 
     # Optional cleanup for multiple <br> inside or around lists
@@ -433,6 +427,7 @@ def read_judge_dashboard(request: Request, judge_name: str):
 
 ANALYSIS_DIR = os.path.join(BASE_DIR, "analysis_documents")
 NPA_ANALYSIS_DIR = os.path.join(BASE_DIR, "npa_analysis_documents")
+V2_ANALYSIS_DIR = os.path.join(BASE_DIR, "v2")
 
 
 def strip_code_fences(text: str) -> str:
@@ -790,7 +785,7 @@ def load_json_analyses(
 
 
 def load_analysis_list() -> dict:
-    """Scan analysis_documents/ and npa_analysis_documents/ and return summary data."""
+    """Scan analysis_documents/, npa_analysis_documents/, and v2/ and return summary data."""
     analyses = []
     severity_scores = []
     outcomes = {"Acquitted": 0, "Convicted": 0, "Unknown": 0}
@@ -898,8 +893,12 @@ def load_analysis_list() -> dict:
     npa_json = load_json_analyses(NPA_ANALYSIS_DIR, "NPA", "npa")
     analyses.extend(npa_json)
 
+    # ── 4. JSON files from v2/ ──
+    v2_json = load_json_analyses(V2_ANALYSIS_DIR, "V2", "v2")
+    analyses.extend(v2_json)
+
     # Update outcomes & severity from all entries
-    for a in std_json + npa_json:
+    for a in std_json + npa_json + v2_json:
         outcomes[a["outcome"]] = outcomes.get(a["outcome"], 0) + 1
         if a["severity_score"] is not None:
             severity_scores.append(a["severity_score"])
@@ -1155,7 +1154,12 @@ def load_json_analysis_detail(fpath: str, slug: str) -> dict | None:
 
     outcome = extract_outcome_from_filename(file_name, legal_raw)
     # Determine source from slug prefix
-    source = "NPA" if slug.startswith("npa_") else "Standard"
+    if slug.startswith("npa_"):
+        source = "NPA"
+    elif slug.startswith("v2_"):
+        source = "V2"
+    else:
+        source = "Standard"
 
     return {
         "slug": slug,
@@ -1180,6 +1184,12 @@ def load_analysis_detail(slug: str) -> dict | None:
     if slug.startswith("npa_"):
         stem = slug[4:]  # remove "npa_" prefix
         fpath = os.path.join(NPA_ANALYSIS_DIR, f"{stem}.json")
+        return load_json_analysis_detail(fpath, slug)
+
+    # Handle V2 JSON slugs  (v2_1, v2_2, ...)
+    if slug.startswith("v2_"):
+        stem = slug[3:]  # remove "v2_" prefix
+        fpath = os.path.join(V2_ANALYSIS_DIR, f"{stem}.json")
         return load_json_analysis_detail(fpath, slug)
 
     # Handle Standard JSON slugs  (std_ACQUITTED_...)
