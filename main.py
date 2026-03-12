@@ -8,7 +8,7 @@ import json
 import glob
 import re
 
-
+# Try imports to support both module execution (uvicorn app.main:app) and script execution (python3 main.py)
 try:
     from app.services import analytics
 except ImportError:
@@ -31,8 +31,8 @@ except ImportError:
 
 app = FastAPI(title="Legal Analytics Dashboard")
 
-
-
+# Session secret for signed cookies
+# In production, set SESSION_SECRET env var to a strong random string
 SESSION_SECRET = os.environ.get(
     "SESSION_SECRET", "change-me-to-a-strong-random-secret-key-in-production"
 )
@@ -49,6 +49,10 @@ def md_to_html(text):
     if not text:
         return ""
     text = str(text)
+
+    # 1. Convert headers (e.g., ### Heading -> <h3>Heading</h3>)
+    # Ensure this happens before bold conversion to avoid nesting strong tags inside h tags prematurely if not needed,
+    # but we can also just strip ** if they are in headers
     text = re.sub(
         r"^###\s+(.*)$",
         r'<h3 class="text-sm font-bold mt-4 mb-2 text-slate-800 dark:text-slate-200">\1</h3>',
@@ -113,6 +117,8 @@ def md_to_html(text):
     )
 
     # 4. Convert \n to <br> (only for lines that aren't already wrapped in HTML blocks)
+    # A simple approach is to convert remaining \n to <br>, but avoid doing it between block tags.
+    # We will just do a simple replace for now.
     text = text.replace("\n", "<br>")
 
     # Optional cleanup for multiple <br> inside or around lists
@@ -428,6 +434,7 @@ def read_judge_dashboard(request: Request, judge_name: str):
 ANALYSIS_DIR = os.path.join(BASE_DIR, "analysis_documents")
 NPA_ANALYSIS_DIR = os.path.join(BASE_DIR, "npa_analysis_documents")
 V2_ANALYSIS_DIR = os.path.join(BASE_DIR, "v2")
+V3_ANALYSIS_DIR = os.path.join(BASE_DIR, "v3")
 
 
 def strip_code_fences(text: str) -> str:
@@ -703,6 +710,64 @@ def load_json_analyses(
         processed_on = data.get("processed_on", "")
         sections = data.get("sections", {})
 
+        if "metadata" in data and "sections" not in data:
+            # It's a V3 JSON file format
+            v3_meta = data.get("metadata", {})
+            court = v3_meta.get("full_court_name", "")
+            date_val = v3_meta.get("date_of_judgement", "")
+            case_number = v3_meta.get("case_number_citations", "")
+            
+            judges_raw = v3_meta.get("presiding_judges", [])
+            judge = ", ".join(judges_raw) if isinstance(judges_raw, list) else str(judges_raw)
+            
+            parties_obj = v3_meta.get("parties", {})
+            parties = ""
+            if isinstance(parties_obj, dict):
+                pet = parties_obj.get("petitioner_appellant", "")
+                res = parties_obj.get("respondent", "")
+                if pet and res:
+                    parties = f"{pet} vs {res}"
+            
+            summary_obj = data.get("summary", {})
+            legal_summary = summary_obj.get("introduction", "") + " " + summary_obj.get("prosecution_plaintiffs_case", "")
+            summary_snippet = (legal_summary[:200] + "...") if len(legal_summary) > 200 else legal_summary
+            
+            v3_class = data.get("classification", {})
+            v3_keywords = [k.lower() for k in v3_class.get("keywords", [])] if isinstance(v3_class.get("keywords"), list) else []
+            if any(k in v3_keywords for k in ["acquittal", "acquitted"]):
+                outcome = "Acquitted"
+            elif any(k in v3_keywords for k in ["conviction", "convicted"]):
+                outcome = "Convicted"
+            else:
+                legal_summary_full = " ".join(str(v) for v in summary_obj.values())
+                outcome = extract_outcome_from_filename(file_name, legal_summary_full)
+            
+            severity = None
+            lapses = data.get("lapses", {})
+            if "severity" in lapses and isinstance(lapses["severity"], dict):
+                sev_score = lapses["severity"].get("score")
+                if sev_score is not None:
+                    try:
+                        severity = int(sev_score)
+                    except ValueError:
+                        pass
+                        
+            results.append({
+                "slug": slug,
+                "filename": file_name,
+                "processed_on": processed_on,
+                "outcome": outcome,
+                "court": court,
+                "judge": judge,
+                "date": date_val,
+                "case_number": case_number,
+                "parties": parties,
+                "severity_score": severity,
+                "summary_snippet": summary_snippet,
+                "source": source_label,
+            })
+            continue
+
         # Legal summary
         legal_sec = sections.get(
             "Comprehensive Legal Summary", sections.get("Judgment at a Glance", {})
@@ -897,8 +962,12 @@ def load_analysis_list() -> dict:
     v2_json = load_json_analyses(V2_ANALYSIS_DIR, "V2", "v2")
     analyses.extend(v2_json)
 
+    # ── 5. JSON files from v3/ ──
+    v3_json = load_json_analyses(V3_ANALYSIS_DIR, "V3", "v3")
+    analyses.extend(v3_json)
+
     # Update outcomes & severity from all entries
-    for a in std_json + npa_json + v2_json:
+    for a in std_json + npa_json + v2_json + v3_json:
         outcomes[a["outcome"]] = outcomes.get(a["outcome"], 0) + 1
         if a["severity_score"] is not None:
             severity_scores.append(a["severity_score"])
@@ -930,6 +999,143 @@ def load_json_analysis_detail(fpath: str, slug: str) -> dict | None:
     processed_on = data.get("processed_on", "")
     sections = data.get("sections", {})
 
+    if "metadata" in data and "sections" not in data:
+        # V3 JSON handling
+        v3_meta = data.get("metadata", {})
+        court = v3_meta.get("full_court_name", "")
+        date_natural = v3_meta.get("date_of_judgement", "")
+        case_number = v3_meta.get("case_number_citations", "")
+        
+        judges_raw = v3_meta.get("presiding_judges", [])
+        judge = ", ".join(judges_raw) if isinstance(judges_raw, list) else str(judges_raw)
+        
+        parties_obj = v3_meta.get("parties", {})
+        parties = ""
+        if isinstance(parties_obj, dict):
+            pet = parties_obj.get("petitioner_appellant", "")
+            res = parties_obj.get("respondent", "")
+            if pet and res:
+                parties = f"{pet} vs {res}"
+        
+        metadata = {
+            "court": court,
+            "date_natural": date_natural,
+            "case_number": case_number,
+            "judge": judge,
+            "parties": parties
+        }
+
+        # Witnesses
+        v3_witnesses = data.get("principal_witnesses_and_ex_pw", [])
+        witnesses = []
+        for w in v3_witnesses:
+            witnesses.append({
+                "Designation": w.get("designation", ""),
+                "Full Name": w.get("full_name", ""),
+                "Role": w.get("role", ""),
+                "Key Testimony": w.get("key_testimony", "")
+            })
+
+        # Legal summary
+        v3_summary = data.get("summary", {})
+        legal_items = []
+        if isinstance(v3_summary, dict):
+            for k, v in v3_summary.items():
+                title = k.replace("_", " ").title()
+                legal_items.append({"title": title, "content": v})
+
+        # Taxonomy
+        v3_class = data.get("classification", {})
+        taxonomy_items = []
+        if isinstance(v3_class, dict):
+            for k, v in v3_class.items():
+                title = k.replace("_", " ").title()
+                if isinstance(v, list):
+                    v = ", ".join(v)
+                if k == "keywords":
+                    taxonomy_items.append({"label": "Keywords", "value": v})
+                elif v:
+                    taxonomy_items.append({"label": title, "value": v})
+
+        # Timeline
+        v3_timeline = data.get("timeline", [])
+        timeline_items = []
+        for t in v3_timeline:
+            date_str = t.get("date", "")
+            title = t.get("title", "")
+            label = f"{date_str} - {title}" if date_str else title
+            detail = t.get("excerpt", "")
+            if t.get("reasoning"):
+                detail += f"\n\n**Reasoning**: {t.get('reasoning')}"
+            timeline_items.append({"label": label, "detail": detail})
+        # Audit
+        v3_lapses = data.get("lapses", {})
+        audit_subsections = []
+        severity_score = None
+        score_justification = ""
+        
+        if isinstance(v3_lapses, dict):
+            for dept, items in v3_lapses.items():
+                if dept in ["severity", "judicial_criticism", "perfect_chain_of_evidence"]:
+                    continue
+                if isinstance(items, list) and items:
+                    dept_items = []
+                    for item in items:
+                        title = item.get("lapse", "")
+                        detail = f"**Impact**: {item.get('impact', '')}\n\n**Reasoning**: {item.get('reasoning', '')}"
+                        dept_items.append({"title": title, "detail": detail})
+                    audit_subsections.append({"heading": f"{dept.title()} Lapses", "items": dept_items})
+            
+            if "judicial_criticism" in v3_lapses:
+                audit_subsections.append({"heading": "Judicial Criticism", "items": [{"title": "", "detail": v3_lapses["judicial_criticism"]}]})
+            if "perfect_chain_of_evidence" in v3_lapses:
+                audit_subsections.append({"heading": "Chain of Evidence Status", "items": [{"title": "", "detail": v3_lapses["perfect_chain_of_evidence"]}]})
+                
+            if "severity" in v3_lapses and isinstance(v3_lapses["severity"], dict):
+                sev_score = v3_lapses["severity"].get("score")
+                if sev_score is not None:
+                    try:
+                        severity_score = int(sev_score)
+                    except ValueError:
+                        pass
+                score_justification = v3_lapses["severity"].get("rationale", "")
+
+        v3_keywords = [k.lower() for k in v3_class.get("keywords", [])] if isinstance(v3_class.get("keywords"), list) else []
+        if any(k in v3_keywords for k in ["acquittal", "acquitted"]):
+            outcome = "Acquitted"
+        elif any(k in v3_keywords for k in ["conviction", "convicted"]):
+            outcome = "Convicted"
+        else:
+            legal_summary_full = " ".join(str(v) for k, v in v3_summary.items()) if isinstance(v3_summary, dict) else ""
+            outcome = extract_outcome_from_filename(file_name, legal_summary_full)
+        
+        # Determine source
+        if slug.startswith("npa_"):
+            source = "NPA"
+        elif slug.startswith("v2_"):
+            source = "V2"
+        elif slug.startswith("v3_"):
+            source = "V3"
+        else:
+            source = "Standard"
+
+        return {
+            "slug": slug,
+            "filename": file_name,
+            "processed_on": processed_on,
+            "outcome": outcome,
+            "metadata": metadata,
+            "witnesses": witnesses,
+            "legal_summary": legal_items,
+            "taxonomy": taxonomy_items,
+            "timeline": timeline_items,
+            "severity_score": severity_score,
+            "score_justification": score_justification,
+            "audit_subsections": audit_subsections,
+            "source": source,
+        }
+
+    # Original V1/V2 parsing logic below
     # Metadata
     meta_sec = sections.get("Metadata Extraction", {})
     meta_content = meta_sec.get("content", "") if isinstance(meta_sec, dict) else ""
@@ -1158,6 +1364,8 @@ def load_json_analysis_detail(fpath: str, slug: str) -> dict | None:
         source = "NPA"
     elif slug.startswith("v2_"):
         source = "V2"
+    elif slug.startswith("v3_"):
+        source = "V3"
     else:
         source = "Standard"
 
@@ -1190,6 +1398,12 @@ def load_analysis_detail(slug: str) -> dict | None:
     if slug.startswith("v2_"):
         stem = slug[3:]  # remove "v2_" prefix
         fpath = os.path.join(V2_ANALYSIS_DIR, f"{stem}.json")
+        return load_json_analysis_detail(fpath, slug)
+
+    # Handle V3 JSON slugs  (v3_1, v3_2, ...)
+    if slug.startswith("v3_"):
+        stem = slug[3:]  # remove "v3_" prefix
+        fpath = os.path.join(V3_ANALYSIS_DIR, f"{stem}.json")
         return load_json_analysis_detail(fpath, slug)
 
     # Handle Standard JSON slugs  (std_ACQUITTED_...)
